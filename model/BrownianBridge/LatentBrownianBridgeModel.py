@@ -15,18 +15,37 @@ def disabled_train(self, mode=True):
     does not change anymore."""
     return self
 
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels=3):
+        super(DecoderBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, 32, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 16, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(16)
+        self.conv3 = nn.Conv2d(16, 1, 3, padding=1)
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        if x.size(-1) != 64 or x.size(-2) != 64:
+            x = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.tanh(self.conv3(x))
+        return x
 
 class LatentBrownianBridgeModel(BrownianBridgeModel):
     def __init__(self, model_config):
         super().__init__(model_config)
-
-        self.vqgan = MultiStageEncoder()
+        
+        # Initialize encoder with 3 output channels to match UNet expectations
+        self.vqgan = MultiStageEncoder(in_channels=1, out_channels=64, num_branches=3, final_channels=3)
+        self.decoder = DecoderBlock(in_channels=3)
+        
         self.vqgan.train = disabled_train
         for param in self.vqgan.parameters():
             param.requires_grad = False
-        print(f"load vqgan from {model_config.VQGAN.params.ckpt_path}")
-
-        # Condition Stage Model
+            
         if self.condition_key == 'nocond':
             self.cond_stage_model = None
         elif self.condition_key == 'first_stage':
@@ -36,53 +55,31 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
         else:
             raise NotImplementedError
 
-    def get_ema_net(self):
-        return self
-
-    def get_parameters(self):
-        if self.condition_key == 'SpatialRescaler':
-            print("get parameters to optimize: SpatialRescaler, UNet")
-            params = itertools.chain(self.denoise_fn.parameters(), self.cond_stage_model.parameters())
-        else:
-            print("get parameters to optimize: UNet")
-            params = self.denoise_fn.parameters()
-        return params
-
-    def apply(self, weights_init):
-        super().apply(weights_init)
-        if self.cond_stage_model is not None:
-            self.cond_stage_model.apply(weights_init)
-        return self
-
     def forward(self, x, x_cond, context=None):
         with torch.no_grad():
+            # Ensure grayscale input
+            if x.shape[1] != 1:
+                x = x.mean(dim=1, keepdim=True)
+            if x_cond.shape[1] != 1:
+                x_cond = x_cond.mean(dim=1, keepdim=True)
             
-            #x = x.mean(dim=1, keepdim=True)  # Convert [B, 3, H, W] → [B, 1, H, W]
-            # Assuming x has shape [batch_size, 1, 64, 64]
-            if x.shape[1] == 1:  # Check if the input is grayscale (1 channel)
-                x = x.repeat(1, 3, 1, 1)  # Repeat the single channel 3 times to create a 3-channel image
-
-            #x = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
+            # Ensure correct spatial dimensions
+            if x.size(-1) != 64 or x.size(-2) != 64:
+                x = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
+            if x_cond.size(-1) != 64 or x_cond.size(-2) != 64:
+                x_cond = F.interpolate(x_cond, size=(64, 64), mode='bilinear', align_corners=False)
+                
             x_latent = self.encode(x, cond=False)
-            
             x_cond_latent = self.encode(x_cond, cond=True)
+            
         context = self.get_cond_stage_context(x_cond)
         return super().forward(x_latent.detach(), x_cond_latent.detach(), context)
-
-    def get_cond_stage_context(self, x_cond):
-        if self.cond_stage_model is not None:
-            context = self.cond_stage_model(x_cond)
-            if self.condition_key == 'first_stage':
-                context = context.detach()
-        else:
-            context = None
-        return context
 
     @torch.no_grad()
     def encode(self, x, cond=True, normalize=None):
         normalize = self.model_config.normalize_latent if normalize is None else normalize
-        model = self.vqgan
-        x_latent = model(x)
+        x_latent = self.vqgan(x)
+        
         if normalize:
             if cond:
                 x_latent = (x_latent - self.cond_latent_mean) / self.cond_latent_std
@@ -98,56 +95,66 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
                 x_latent = x_latent * self.cond_latent_std + self.cond_latent_mean
             else:
                 x_latent = x_latent * self.ori_latent_std + self.ori_latent_mean
-        model = self.vqgan
-        if self.model_config.latent_before_quant_conv:
-            x_latent = model.quant_conv(x_latent)
-        x_latent_quant, loss, _ = model.quantize(x_latent)
-        out = model.decode(x_latent_quant)
+        
+        out = self.decoder(x_latent)
         return out
+
+    def get_cond_stage_context(self, x_cond):
+        if self.cond_stage_model is not None:
+            context = self.cond_stage_model(x_cond)
+            if self.condition_key == 'first_stage':
+                context = context.detach()
+        else:
+            context = None
+        #return context
+        return None
+        
+    def get_parameters(self):
+        if self.condition_key == 'SpatialRescaler':
+            print("get parameters to optimize: SpatialRescaler, UNet, Decoder")
+            params = itertools.chain(self.denoise_fn.parameters(), 
+                                   self.cond_stage_model.parameters(),
+                                   self.decoder.parameters())
+        else:
+            print("get parameters to optimize: UNet, Decoder")
+            params = itertools.chain(self.denoise_fn.parameters(), 
+                                   self.decoder.parameters())
+        return params
 
     @torch.no_grad()
     def sample(self, x_cond, clip_denoised=False, sample_mid_step=False):
+        if x_cond.shape[1] != 1:
+            x_cond = x_cond.mean(dim=1, keepdim=True)
+        if x_cond.size(-1) != 64 or x_cond.size(-2) != 64:
+            x_cond = F.interpolate(x_cond, size=(64, 64), mode='bilinear', align_corners=False)
+            
         x_cond_latent = self.encode(x_cond, cond=True)
+        
         if sample_mid_step:
-            temp, one_step_temp = self.p_sample_loop(y=x_cond_latent,
-                                                     context=self.get_cond_stage_context(x_cond),
-                                                     clip_denoised=clip_denoised,
-                                                     sample_mid_step=sample_mid_step)
+            temp, one_step_temp = self.p_sample_loop(
+                y=x_cond_latent,
+                context=self.get_cond_stage_context(x_cond),
+                clip_denoised=clip_denoised,
+                sample_mid_step=sample_mid_step
+            )
+            
             out_samples = []
-            for i in tqdm(range(len(temp)), initial=0, desc="save output sample mid steps", dynamic_ncols=True,
-                          smoothing=0.01):
-                with torch.no_grad():
-                    out = self.decode(temp[i].detach(), cond=False)
+            for i in tqdm(range(len(temp)), desc="save output sample mid steps"):
+                out = self.decode(temp[i].detach(), cond=False)
                 out_samples.append(out.to('cpu'))
 
             one_step_samples = []
-            for i in tqdm(range(len(one_step_temp)), initial=0, desc="save one step sample mid steps",
-                          dynamic_ncols=True,
-                          smoothing=0.01):
-                with torch.no_grad():
-                    out = self.decode(one_step_temp[i].detach(), cond=False)
+            for i in tqdm(range(len(one_step_temp)), desc="save one step sample mid steps"):
+                out = self.decode(one_step_temp[i].detach(), cond=False)
                 one_step_samples.append(out.to('cpu'))
+                
             return out_samples, one_step_samples
         else:
-            temp = self.p_sample_loop(y=x_cond_latent,
-                                      context=self.get_cond_stage_context(x_cond),
-                                      clip_denoised=clip_denoised,
-                                      sample_mid_step=sample_mid_step)
-            x_latent = temp
-            out = self.decode(x_latent, cond=False)
+            temp = self.p_sample_loop(
+                y=x_cond_latent,
+                context=self.get_cond_stage_context(x_cond),
+                clip_denoised=clip_denoised,
+                sample_mid_step=sample_mid_step
+            )
+            out = self.decode(temp, cond=False)
             return out
-
-    @torch.no_grad()
-    def sample_vqgan(self, x):
-        x_rec, _ = self.vqgan(x)
-        return x_rec
-
-    # @torch.no_grad()
-    # def reverse_sample(self, x, skip=False):
-    #     x_ori_latent = self.vqgan.encoder(x)
-    #     temp, _ = self.brownianbridge.reverse_p_sample_loop(x_ori_latent, x, skip=skip, clip_denoised=False)
-    #     x_latent = temp[-1]
-    #     x_latent = self.vqgan.quant_conv(x_latent)
-    #     x_latent_quant, _, _ = self.vqgan.quantize(x_latent)
-    #     out = self.vqgan.decode(x_latent_quant)
-    #     return out
