@@ -16,7 +16,7 @@ data:
   dataset_name: 'Brats'
   dataset_type: 'custom_aligned'
   dataset_config:
-    dataset_path: 'datasets\Brats'
+    dataset_path: 'Brats'
     image_size: 256
     channels: 3
     to_normal: True
