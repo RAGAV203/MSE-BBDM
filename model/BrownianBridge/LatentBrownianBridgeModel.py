@@ -4,13 +4,11 @@ import random
 import torch
 import torch.nn as nn
 from tqdm.autonotebook import tqdm
+import torch.nn.functional as F
 
 from model.BrownianBridge.BrownianBridgeModel import BrownianBridgeModel
 from model.BrownianBridge.base.modules.encoders.modules import SpatialRescaler
 from model.MSEncoder.MSEncoder import MultiStageEncoder
-
-from model.VQGAN.vqgan import VQModel
-
 
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode
@@ -58,7 +56,15 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
 
     def forward(self, x, x_cond, context=None):
         with torch.no_grad():
+            
+            #x = x.mean(dim=1, keepdim=True)  # Convert [B, 3, H, W] → [B, 1, H, W]
+            # Assuming x has shape [batch_size, 1, 64, 64]
+            if x.shape[1] == 1:  # Check if the input is grayscale (1 channel)
+                x = x.repeat(1, 3, 1, 1)  # Repeat the single channel 3 times to create a 3-channel image
+
+            #x = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
             x_latent = self.encode(x, cond=False)
+            
             x_cond_latent = self.encode(x_cond, cond=True)
         context = self.get_cond_stage_context(x_cond)
         return super().forward(x_latent.detach(), x_cond_latent.detach(), context)
@@ -76,9 +82,7 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
     def encode(self, x, cond=True, normalize=None):
         normalize = self.model_config.normalize_latent if normalize is None else normalize
         model = self.vqgan
-        x_latent = model.encoder(x)
-        if not self.model_config.latent_before_quant_conv:
-            x_latent = model.quant_conv(x_latent)
+        x_latent = model(x)
         if normalize:
             if cond:
                 x_latent = (x_latent - self.cond_latent_mean) / self.cond_latent_std
