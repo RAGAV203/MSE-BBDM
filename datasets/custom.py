@@ -11,7 +11,6 @@ from PIL import Image
 import cv2
 import os
 
-
 @Registers.datasets.register_with_name('custom_single')
 class CustomSingleDataset(Dataset):
     def __init__(self, dataset_config, stage='train'):
