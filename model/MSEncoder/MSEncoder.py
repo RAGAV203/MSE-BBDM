@@ -49,8 +49,6 @@ class MultiStageEncoder(nn.Module):
         )
         
     def forward(self, x):
-        if x.size(-1) != 64 or x.size(-2) != 64:
-            x = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
         
         # Get multi-scale features
         branch_outputs = [branch(x) for branch in self.branches]
