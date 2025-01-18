@@ -27,7 +27,6 @@ class BranchBlock(nn.Module):
         self.block2 = ConvBlock(out_channels, out_channels, kernel_size, stride)
         
     def forward(self, x):
-        x = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
         out1 = self.block1(x)
         out2 = self.block2(out1)
         return out2 + out1
